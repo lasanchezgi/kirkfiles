@@ -38,12 +38,35 @@ system: |
     · dates_mentioned    — array de fechas mencionadas (vacío si ninguna)
     · quote_verbatim     — la cita TEXTUAL exacta del transcript que sustenta el claim
 
-  Definición de claim_type:
-    fact           — se presenta como hecho objetivo ("el arma era una Mauser")
-    speculation    — conjetura o teoría ("creo que fue un montaje")
-    interpretation — lectura subjetiva de un hecho ("eso demuestra que mienten")
-    chronology     — ubica un evento en el tiempo ("tres días después del tiroteo")
-    relation       — vínculo entre personas/entidades ("Robinson conocía a X")
+  Definición de claim_type — LEE ESTO CON CUIDADO, es la distinción más importante:
+
+    fact           — dato verificable EXTERNAMENTE: con fuente citada o verificable
+                     (documento, declaración oficial, registro público, footage).
+                     La prueba: ¿podría un tercero confirmarlo o desmentirlo con una
+                     fuente independiente? Si sí → fact.
+                     Ej: "El gobernador Cox declaró que Robinson llegó a las 8:29."
+
+    interpretation — el ENCUADRE, lectura o conclusión de Candace sobre un evento real.
+                     AUNQUE lo enuncie con total certeza ("esto es lo que pasó",
+                     "fue ejecutado públicamente"), si es SU lectura de los hechos y no
+                     un dato que un tercero pueda verificar → interpretation.
+                     Ej: "Charlie fue ejecutado públicamente" (su encuadre del evento).
+
+    speculation    — hipótesis explícita o posibilidad que ELLA MISMA marca como no
+                     confirmada ("creo que", "es posible que", "sospecho", "tal vez"),
+                     o una afirmación causal/atributiva SIN fuente que la respalde.
+                     Ej: "TPUSA estaba bajo presión por Israel" (sin fuente).
+
+    relation       — vínculo entre dos personas o entidades.
+                     Ej: "Robinson conocía a su compañero de cuarto."
+
+    chronology     — ancla temporal VERIFICABLE sobre el caso (hora/fecha de un evento).
+                     Ej: "El disparo ocurrió a las 12:23 PM."
+
+  Regla de desempate fact vs interpretation: por defecto, si la frase contiene un
+  juicio, una valoración o una causa que Candace infiere, NO es fact. Reserva fact
+  para datos secos y atribuibles. Ante la duda entre fact e interpretation, elige
+  interpretation; entre fact y speculation (afirmación sin fuente), elige speculation.
 
   REGLA DE quote_verbatim: debe ser una subcadena LITERAL del fragmento, sin
   reescribir. Si no puedes citar textualmente, no generes el claim.
