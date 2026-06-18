@@ -317,6 +317,106 @@ def clear_contradictions(conn: sqlite3.Connection, claim_type: str | None = None
     return n
 
 
+# --------------------------------------------------------------------------- #
+# Detección de artefactos de datos (Opción A)
+# --------------------------------------------------------------------------- #
+# Una "contradicción" puede ser espuria si el conflicto no nace de que Candace
+# diga cosas distintas, sino de un desajuste INTERNO de un claim entre su
+# claim_text (paráfrasis de Fase B) y su quote_verbatim (cita literal del audio).
+# Ej. real: claim_text "asesinado el 10 de septiembre" / quote "On September 11th…"
+#           claim_text "en Orem, Utah"                 / quote "in Aurum, Utah"
+# Esto no se puede detectar de forma fiable en SQL puro (hay que extraer y
+# comparar fechas/nombres), así que se hace en Python y se marca data_artifact=1.
+
+import re  # noqa: E402  (agrupado con su lógica)
+
+# Tokens "duros" que deberían sobrevivir a la paráfrasis/traducción: números de
+# fecha/hora y nombres propios. Si un claim_text cita uno que su propia quote no
+# respalda → desajuste interno.
+#   · Números 1-2 dígitos, con sufijo ordinal opcional ("11th", "9th"). Los años de
+#     4 dígitos quedan fuera por \b. El grupo captura solo el dígito.
+_ARTIFACT_NUM_RE = re.compile(r"\b(\d{1,2})(?:st|nd|rd|th)?\b")
+#   · Nombre propio seguido de una palabra-ancla (p.ej. "Orem, Utah"). Anclar en la
+#     palabra siguiente evita confundir traducciones ("Este"↔"Eastern", sin ancla
+#     común) con sustituciones reales ("Orem"↔"Aurum", ambas ancladas en "Utah").
+_ARTIFACT_ANCHORED_RE = re.compile(r"\b([A-Z][a-zA-Z]{3,})\b[\s,]+([A-Za-z]{3,})")
+# Nombres propios recurrentes y legítimos del caso → no cuentan como artefacto.
+_ARTIFACT_STOP = {
+    "charlie", "kirk", "erika", "erica", "robinson", "tyler", "candace", "owens",
+    "turning", "point", "israel", "josh", "hammer", "zoom", "woodland", "park",
+    "therese", "bible", "college", "utah", "mauser", "eastern", "este",
+    "january", "february", "march", "april", "may", "june", "july", "august",
+    "september", "october", "november", "december",
+    "enero", "febrero", "marzo", "abril", "mayo", "junio", "julio", "agosto",
+    "septiembre", "octubre", "noviembre", "diciembre",
+}
+
+
+def _anchored_proper(s: str) -> dict[str, set[str]]:
+    """Mapa palabra-ancla(siguiente) → nombres propios que la preceden.
+    Ej. "Orem, Utah" → {'utah': {'Orem'}}."""
+    out: dict[str, set[str]] = {}
+    for name, nxt in _ARTIFACT_ANCHORED_RE.findall(s):
+        if name.lower() in _ARTIFACT_STOP:
+            continue
+        out.setdefault(nxt.lower(), set()).add(name)
+    return out
+
+
+def _claim_internal_mismatch(claim_text: str, quote: str) -> str | None:
+    """¿El claim_text dice algo que su propia quote_verbatim no respalda?
+
+    Devuelve el tipo de desajuste ('date/number' | 'proper-noun') o None."""
+    ct, qv = claim_text or "", quote or ""
+    # 1) Número de fecha/hora citado en claim_text pero ausente de la quote
+    #    (la quote debe tener OTRO número, no solo carecer de él).
+    ct_nums = {int(n) for n in _ARTIFACT_NUM_RE.findall(ct)}
+    qv_nums = {int(n) for n in _ARTIFACT_NUM_RE.findall(qv)}
+    if ct_nums and qv_nums and (ct_nums - qv_nums):
+        return "date/number"
+    # 2) Nombre propio SUSTITUIDO bajo la misma ancla (p.ej. Orem↔Aurum ante "Utah").
+    ct_map, qv_map = _anchored_proper(ct), _anchored_proper(qv)
+    for anchor, ct_names in ct_map.items():
+        qv_names = qv_map.get(anchor)
+        if qv_names and (ct_names - qv_names) and (qv_names - ct_names):
+            return "proper-noun"
+    return None
+
+
+def flag_data_artifacts(conn: sqlite3.Connection, claim_type: str | None = None) -> list[dict]:
+    """Marca data_artifact=1 en las contradicciones cuyo conflicto proviene de un
+    desajuste claim_text↔quote_verbatim en alguno de sus dos claims.
+
+    Con ``claim_type`` limita el barrido a ese tipo. Devuelve los pares marcados
+    (con el motivo) para auditoría."""
+    conn.row_factory = sqlite3.Row
+    sql = """
+        SELECT x.id, x.claim_a_id, x.claim_b_id,
+               a.claim_text AS a_text, a.quote_verbatim AS a_quote,
+               b.claim_text AS b_text, b.quote_verbatim AS b_quote
+        FROM contradictions x
+        JOIN claims a ON a.id = x.claim_a_id
+        JOIN claims b ON b.id = x.claim_b_id
+    """
+    params: tuple = ()
+    if claim_type:
+        sql += " WHERE a.claim_type = ?"
+        params = (claim_type,)
+    flagged: list[dict] = []
+    for r in conn.execute(sql, params).fetchall():
+        reason_a = _claim_internal_mismatch(r["a_text"], r["a_quote"])
+        reason_b = _claim_internal_mismatch(r["b_text"], r["b_quote"])
+        if reason_a or reason_b:
+            conn.execute("UPDATE contradictions SET data_artifact = 1 WHERE id = ?", (r["id"],))
+            flagged.append({
+                "id": r["id"],
+                "claim": r["claim_a_id"] if reason_a else r["claim_b_id"],
+                "reason": reason_a or reason_b,
+            })
+    conn.commit()
+    return flagged
+
+
 def record_usage(conn: sqlite3.Connection, model: str, tin: int, tout: int, cost: float) -> None:
     conn.execute(
         """

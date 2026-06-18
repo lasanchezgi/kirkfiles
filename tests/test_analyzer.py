@@ -93,6 +93,40 @@ def _seed():
     return conn
 
 
+def test_artifact_date_mismatch_with_ordinal():
+    # claim_text dice "10 de septiembre"; la quote dice "September 11th" → artefacto.
+    r = analyzer._claim_internal_mismatch(
+        "Charlie Kirk fue asesinado el 10 de septiembre de 2025.",
+        "On September 11th, the day after his assassination, Charlie spoke.",
+    )
+    assert r == "date/number"
+
+
+def test_artifact_proper_noun_substitution_under_shared_anchor():
+    # Orem ↔ Aurom, ambos anclados en "Utah" → sustitución de nombre propio.
+    r = analyzer._claim_internal_mismatch(
+        "Charlie Kirk fue asesinado en Orem, Utah, el 10 de septiembre.",
+        "what happened in Aurum, Utah, on September 10th.",
+    )
+    assert r == "proper-noun"
+
+
+def test_artifact_translation_is_not_flagged():
+    # "Este" (ES) vs "Eastern" (EN) es traducción, no sustitución → None.
+    r = analyzer._claim_internal_mismatch(
+        "El tiroteo ocurrió a las 8:36 PM hora del Este.",
+        "the shooting took place at 8:36 PM Eastern.",
+    )
+    assert r is None
+
+
+def test_artifact_year_not_split_and_matching_dates_ok():
+    # "10 de septiembre de 2025" vs "September 10th, 2025": 2025 no se parte en 20/25.
+    assert analyzer._claim_internal_mismatch(
+        "asesinado el 10 de septiembre de 2025.", "killed on September 10th, 2025."
+    ) is None
+
+
 def test_insert_contradiction_idempotent():
     conn = _seed()
     pair = {"a": {"id": 1}, "b": {"id": 2}}

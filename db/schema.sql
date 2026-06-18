@@ -78,10 +78,12 @@ CREATE TABLE IF NOT EXISTS contradictions (
     severity           TEXT,                        -- high | medium | low
     explanation        TEXT,
     confidence_score   REAL,
+    data_artifact      INTEGER NOT NULL DEFAULT 0,  -- 1 = el conflicto viene de ruido de datos (claim_text ↔ quote_verbatim), no de Candace
     detected_at        DATETIME DEFAULT CURRENT_TIMESTAMP,
 
     CHECK (contradiction_type IS NULL OR contradiction_type IN ('direct','evolution','abandoned','reinforced')),
     CHECK (severity           IS NULL OR severity           IN ('high','medium','low')),
+    CHECK (data_artifact IN (0,1)),
     CHECK (claim_a_id <> claim_b_id),
 
     -- idempotencia: un par de claims se evalúa una sola vez
