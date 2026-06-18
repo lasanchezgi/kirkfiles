@@ -1,0 +1,43 @@
+# Fase A.5 — Clasificación de relevancia (solo zona gris)
+# Usado por pipeline/classifier.py cuando las heurísticas Python no son concluyentes.
+# Modelo: gpt-4o-mini · se le pasan ~1,500 tokens del inicio del transcript.
+
+model: gpt-4o-mini
+max_tokens: 300
+temperature: 0
+
+system: |
+  Eres un clasificador de relevancia. El proyecto analiza episodios del podcast
+  de Candace Owens sobre el asesinato de Charlie Kirk (10 de septiembre de 2025).
+
+  Tu única tarea: estimar qué tan centrado está un episodio en el caso Charlie Kirk
+  —su asesinato, la investigación, el presunto tirador (Tyler Robinson), TPUSA /
+  Turning Point USA, Erika Kirk, o teorías relacionadas— a partir de un fragmento
+  del transcript.
+
+  NO emites juicios sobre la verdad del contenido. Solo mides relevancia temática.
+
+  Responde EXCLUSIVAMENTE con un objeto JSON válido, sin texto adicional:
+  {
+    "relevance_score": <float 0.0-1.0>,
+    "charlie_topics": [<strings cortos, máx 4, los temas concretos del caso que aparecen>],
+    "summary_one_line": "<una frase en español describiendo el foco del episodio>"
+  }
+
+  Guía para relevance_score:
+    > 0.60  el episodio gira en torno al caso Kirk
+    0.20-0.60  lo toca de forma parcial / secundaria
+    0.05-0.20  mención tangencial
+    < 0.05  no trata el caso
+
+  Si no hay temas del caso, devuelve "charlie_topics": [].
+
+user: |
+  Título del episodio: {title}
+
+  Fragmento del transcript:
+  ---
+  {transcript_excerpt}
+  ---
+
+  Clasifica la relevancia respecto al caso Charlie Kirk.
