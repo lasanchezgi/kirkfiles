@@ -104,6 +104,7 @@ CREATE TABLE IF NOT EXISTS verifications (
     sources_contradicting TEXT,                     -- JSON array de URLs
     primary_documents     TEXT,                     -- JSON array — FOIA, judiciales, etc.
     llm_reasoning         TEXT,
+    confidence            REAL,                     -- 0..1 — qué tan seguro está el LLM del veredicto
     verified_at           DATETIME DEFAULT CURRENT_TIMESTAMP,
 
     CHECK (verdict IS NULL OR verdict IN ('supported','contradicted','ambiguous','unverifiable')),
