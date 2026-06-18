@@ -23,6 +23,7 @@ from __future__ import annotations
 
 import json
 import sqlite3
+import time
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -40,6 +41,11 @@ CHUNK_TOKENS = 6_000
 CHUNK_OVERLAP = 200
 MAX_CHUNKS = {"high": 3, "partial": 2}   # low/none no se procesan
 ENCODING = "o200k_base"                  # tokenizer de gpt-4o
+
+# La org tiene un límite bajo de TPM (30k) en gpt-4o. Pausamos entre chunks para
+# no reventarlo y reintentamos con backoff cuando aun así llega un 429.
+THROTTLE_SECONDS = 18      # ~3-4 llamadas/min, holgado bajo 30k TPM
+MAX_RETRIES = 6
 
 # Precio gpt-4o (USD por token) — para registrar costo real en api_usage.
 PRICE_IN = 2.50 / 1_000_000
@@ -107,13 +113,30 @@ class ChunkResult:
         return self.tokens_input * PRICE_IN + self.tokens_output * PRICE_OUT
 
 
+def _create_with_retry(client, **kwargs):
+    """Llama a la API reintentando con backoff exponencial ante un 429 (rate limit)."""
+    from openai import RateLimitError
+
+    for attempt in range(MAX_RETRIES):
+        try:
+            return client.chat.completions.create(**kwargs)
+        except RateLimitError:
+            if attempt == MAX_RETRIES - 1:
+                raise
+            wait = THROTTLE_SECONDS * (attempt + 1)
+            typer.secho(f"    · rate limit, reintento en {wait}s…", fg=typer.colors.YELLOW)
+            time.sleep(wait)
+    raise RuntimeError("unreachable")
+
+
 def extract_chunk(chunk_text_: str, ctx: dict, client, prompt: dict) -> ChunkResult:
     """Una llamada a gpt-4o sobre un chunk → claims crudos + uso de tokens."""
     messages = [
         {"role": "system", "content": prompt["system"]},
         {"role": "user", "content": prompt["user"].format(chunk_text=chunk_text_, **ctx)},
     ]
-    resp = client.chat.completions.create(
+    resp = _create_with_retry(
+        client,
         model=prompt.get("model", "gpt-4o"),
         messages=messages,
         temperature=prompt.get("temperature", 0),
@@ -242,6 +265,8 @@ def process_episode(conn, ep: sqlite3.Row, client, prompt, encoder, force: bool)
             "chunk_index": i,
             "chunk_total": len(chunks),
         }
+        if i > 1:
+            time.sleep(THROTTLE_SECONDS)  # mantenerse bajo el TPM entre chunks
         result = extract_chunk(chunk, ctx, client, prompt)
         record_usage(conn, ep["id"], result)
 
@@ -279,6 +304,8 @@ def main(
     n_eps = total_claims = total_calls = total_tokens = 0
     total_cost = 0.0
     for ep in episodes:
+        if n_eps > 0:
+            time.sleep(THROTTLE_SECONDS)  # pausa entre episodios (TPM)
         s = process_episode(conn, ep, client, prompt, encoder, force)
         n_eps += 1
         total_claims += s["claims"]
