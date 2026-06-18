@@ -1,0 +1,6 @@
+.env
+db/kirkfiles.db
+data/episodes/
+__pycache__/
+*.pyc
+.venv/
