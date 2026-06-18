@@ -12,6 +12,7 @@ lxml>=5.0
 # LLM / embeddings (Fases A.5–D)
 openai>=1.40
 tiktoken>=0.7           # conteo/chunking de tokens para gpt-4o (Fase B)
+numpy>=1.26             # similitud coseno vectorizada entre embeddings (Fase C)
 
 # Base de datos
 sqlite-vec>=0.1.3

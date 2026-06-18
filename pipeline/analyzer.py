@@ -1,0 +1,448 @@
+"""Fase C — Detección de contradicciones entre claims.
+
+Estrategia en dos pasos para minimizar llamadas al LLM (regla de oro del proyecto):
+
+  Paso 1 — Embeddings + similitud coseno ($ casi nulo, sin gpt-4o):
+      · Genera un embedding (text-embedding-3-small) para cada claim que aún no lo
+        tenga y lo guarda en ``claims.embedding`` (BLOB float32).
+      · Calcula la similitud coseno entre pares de claims SOLO si:
+            - son de episodios DISTINTOS (un episodio no se contradice consigo mismo)
+            - son del MISMO claim_type (una speculation no contradice a un fact)
+      · Los pares con coseno >= SIM_THRESHOLD pasan al Paso 2. El resto se descarta.
+
+  Paso 2 — gpt-4o evalúa el conflicto real (solo los candidatos):
+      Cada par candidato va al LLM, que lo clasifica en:
+        direct | evolution | abandoned | reinforced | unrelated
+      Solo ``direct``, ``evolution`` y ``abandoned`` se guardan en ``contradictions``.
+      ``reinforced`` y ``unrelated`` se descartan (no son contradicciones).
+
+Idempotencia: el par (claim_a_id, claim_b_id) tiene UNIQUE en la tabla. Los pares ya
+presentes en ``contradictions`` no se reevalúan salvo ``--force`` (que limpia la tabla
+y reevalúa todo). Nota: como ``reinforced``/``unrelated`` no se persisten, una
+reejecución vuelve a evaluarlos; por eso conviene cerrar la fase de una sola pasada.
+
+Uso:
+    python -m pipeline.analyzer              # genera embeddings + evalúa candidatos
+    python -m pipeline.analyzer --dry-run    # solo cuenta candidatos y estima costo
+    python -m pipeline.analyzer --force      # reevalúa todos los pares
+"""
+
+from __future__ import annotations
+
+import json
+import sqlite3
+import time
+from dataclasses import dataclass
+from pathlib import Path
+
+import typer
+
+from scraper.happyscribe import DB_PATH, get_connection
+
+# --------------------------------------------------------------------------- #
+# Configuración
+# --------------------------------------------------------------------------- #
+ROOT = Path(__file__).resolve().parent.parent
+PROMPT_PATH = ROOT / "prompts" / "detect_contradictions.yaml"
+
+EMBED_MODEL = "text-embedding-3-small"
+EMBED_BATCH = 256              # claims por llamada de embeddings
+SIM_THRESHOLD = 0.82           # coseno mínimo para que un par sea candidato
+
+# Precios (USD por token) — para registrar costo real en api_usage.
+PRICE_EMBED = 0.02 / 1_000_000              # text-embedding-3-small
+PRICE_IN = 2.50 / 1_000_000                 # gpt-4o input
+PRICE_OUT = 10.00 / 1_000_000               # gpt-4o output
+
+# Estimación para el --dry-run (tamaño típico de una llamada de par).
+EST_TOKENS_IN = 700
+EST_TOKENS_OUT = 150
+
+# gpt-4o tiene un TPM bajo (30k) en esta org. Las llamadas de par son pequeñas
+# (~850 tokens), así que una pausa corta + backoff ante 429 basta.
+THROTTLE_SECONDS = 2.5
+MAX_RETRIES = 6
+
+# Solo estos tipos son contradicciones que se guardan.
+_STORED_TYPES = {"direct", "evolution", "abandoned"}
+_VALID_RELATION = {"direct", "evolution", "abandoned", "reinforced", "unrelated"}
+_VALID_SEVERITY = {"high", "medium", "low"}
+
+
+# --------------------------------------------------------------------------- #
+# Cliente / prompt (imports perezosos: los tests offline no los necesitan)
+# --------------------------------------------------------------------------- #
+def load_prompt() -> dict:
+    import yaml
+
+    return yaml.safe_load(PROMPT_PATH.read_text(encoding="utf-8"))
+
+
+def _build_client():
+    from dotenv import load_dotenv
+    from openai import OpenAI
+
+    load_dotenv(ROOT / ".env")
+    return OpenAI()
+
+
+def _with_retry(fn, **kwargs):
+    """Ejecuta una llamada a la API reintentando con backoff ante un 429."""
+    from openai import RateLimitError
+
+    for attempt in range(MAX_RETRIES):
+        try:
+            return fn(**kwargs)
+        except RateLimitError:
+            if attempt == MAX_RETRIES - 1:
+                raise
+            wait = THROTTLE_SECONDS * (attempt + 1) * 2
+            typer.secho(f"    · rate limit, reintento en {wait:.0f}s…", fg=typer.colors.YELLOW)
+            time.sleep(wait)
+    raise RuntimeError("unreachable")
+
+
+# --------------------------------------------------------------------------- #
+# Paso 1a — Embeddings
+# --------------------------------------------------------------------------- #
+def claims_without_embedding(conn: sqlite3.Connection) -> list[sqlite3.Row]:
+    conn.row_factory = sqlite3.Row
+    return conn.execute(
+        "SELECT id, claim_text FROM claims WHERE embedding IS NULL ORDER BY id"
+    ).fetchall()
+
+
+def _to_blob(vector) -> bytes:
+    import numpy as np
+
+    return np.asarray(vector, dtype=np.float32).tobytes()
+
+
+def generate_embeddings(conn: sqlite3.Connection, client) -> dict:
+    """Genera y guarda los embeddings faltantes. Devuelve métricas de uso."""
+    pending = claims_without_embedding(conn)
+    stats = {"embedded": 0, "calls": 0, "tokens": 0, "cost": 0.0}
+    if not pending:
+        return stats
+
+    for start in range(0, len(pending), EMBED_BATCH):
+        batch = pending[start : start + EMBED_BATCH]
+        resp = _with_retry(
+            client.embeddings.create,
+            model=EMBED_MODEL,
+            input=[r["claim_text"] for r in batch],
+        )
+        for row, item in zip(batch, resp.data):
+            conn.execute(
+                "UPDATE claims SET embedding = ? WHERE id = ?",
+                (_to_blob(item.embedding), row["id"]),
+            )
+        conn.commit()
+
+        tokens = resp.usage.prompt_tokens
+        cost = tokens * PRICE_EMBED
+        record_usage(conn, EMBED_MODEL, tokens, 0, cost)
+        stats["embedded"] += len(batch)
+        stats["calls"] += 1
+        stats["tokens"] += tokens
+        stats["cost"] += cost
+        typer.secho(
+            f"  · embeddings {stats['embedded']}/{len(pending)}", fg=typer.colors.CYAN
+        )
+    return stats
+
+
+# --------------------------------------------------------------------------- #
+# Paso 1b — Pares candidatos por similitud coseno (Python puro + numpy)
+# --------------------------------------------------------------------------- #
+def load_claims_with_embeddings(conn: sqlite3.Connection) -> list[sqlite3.Row]:
+    conn.row_factory = sqlite3.Row
+    return conn.execute(
+        """
+        SELECT c.id, c.episode_id, c.claim_type, c.claim_text, c.quote_verbatim,
+               c.embedding, e.episode_number, e.published_at
+        FROM claims c
+        JOIN episodes e ON e.id = c.episode_id
+        WHERE c.embedding IS NOT NULL
+        ORDER BY c.id
+        """
+    ).fetchall()
+
+
+def candidate_pairs(claims: list[sqlite3.Row], threshold: float = SIM_THRESHOLD) -> list[dict]:
+    """Pares (mismo tipo, episodios distintos) con coseno >= threshold.
+
+    Cada par sale como dict {a, b, similarity} con a.id < b.id (orden estable)."""
+    import numpy as np
+
+    by_type: dict[str, list[sqlite3.Row]] = {}
+    for row in claims:
+        by_type.setdefault(row["claim_type"], []).append(row)
+
+    pairs: list[dict] = []
+    for rows in by_type.values():
+        if len(rows) < 2:
+            continue
+        mat = np.array(
+            [np.frombuffer(r["embedding"], dtype=np.float32) for r in rows]
+        )
+        norms = np.linalg.norm(mat, axis=1, keepdims=True)
+        norms[norms == 0] = 1.0
+        unit = mat / norms
+        sims = unit @ unit.T  # matriz simétrica de cosenos
+
+        n = len(rows)
+        for i in range(n):
+            for j in range(i + 1, n):
+                if rows[i]["episode_id"] == rows[j]["episode_id"]:
+                    continue
+                s = float(sims[i, j])
+                if s < threshold:
+                    continue
+                a, b = rows[i], rows[j]
+                if a["id"] > b["id"]:
+                    a, b = b, a
+                pairs.append({"a": a, "b": b, "similarity": round(s, 4)})
+    pairs.sort(key=lambda p: p["similarity"], reverse=True)
+    return pairs
+
+
+# --------------------------------------------------------------------------- #
+# Paso 2 — LLM evalúa el conflicto
+# --------------------------------------------------------------------------- #
+@dataclass
+class Verdict:
+    relation_type: str
+    severity: str
+    confidence: float
+    explanation: str
+    tokens_input: int
+    tokens_output: int
+    model: str
+
+    @property
+    def cost_usd(self) -> float:
+        return self.tokens_input * PRICE_IN + self.tokens_output * PRICE_OUT
+
+    @property
+    def is_contradiction(self) -> bool:
+        return self.relation_type in _STORED_TYPES
+
+
+def _ep_label(row: sqlite3.Row) -> str:
+    return f"Ep {row['episode_number']}" if row["episode_number"] else f"id {row['episode_id']}"
+
+
+def evaluate_pair(pair: dict, client, prompt: dict) -> Verdict:
+    a, b = pair["a"], pair["b"]
+    ctx = {
+        "ep_a": _ep_label(a), "date_a": a["published_at"] or "s/f",
+        "type_a": a["claim_type"], "text_a": a["claim_text"], "quote_a": a["quote_verbatim"],
+        "ep_b": _ep_label(b), "date_b": b["published_at"] or "s/f",
+        "type_b": b["claim_type"], "text_b": b["claim_text"], "quote_b": b["quote_verbatim"],
+    }
+    messages = [
+        {"role": "system", "content": prompt["system"]},
+        {"role": "user", "content": prompt["user"].format(**ctx)},
+    ]
+    resp = _with_retry(
+        client.chat.completions.create,
+        model=prompt.get("model", "gpt-4o"),
+        messages=messages,
+        temperature=prompt.get("temperature", 0),
+        max_tokens=prompt.get("max_tokens", 500),
+        response_format={"type": "json_object"},
+    )
+    data = json.loads(resp.choices[0].message.content)
+    return _sanitize_verdict(data, resp)
+
+
+def _sanitize_verdict(data: dict, resp) -> Verdict:
+    rel = str(data.get("relation_type", "")).strip().lower()
+    if rel not in _VALID_RELATION:
+        rel = "unrelated"  # ante un valor raro, no lo tratamos como contradicción
+    sev = str(data.get("severity", "")).strip().lower()
+    if sev not in _VALID_SEVERITY:
+        sev = "low"
+    try:
+        conf = max(0.0, min(1.0, float(data.get("confidence", 0.0))))
+    except (TypeError, ValueError):
+        conf = 0.0
+    return Verdict(
+        relation_type=rel,
+        severity=sev,
+        confidence=round(conf, 3),
+        explanation=str(data.get("explanation", "")).strip(),
+        tokens_input=resp.usage.prompt_tokens,
+        tokens_output=resp.usage.completion_tokens,
+        model=resp.model,
+    )
+
+
+# --------------------------------------------------------------------------- #
+# Persistencia
+# --------------------------------------------------------------------------- #
+def existing_pairs(conn: sqlite3.Connection) -> set[tuple[int, int]]:
+    return {
+        (r[0], r[1])
+        for r in conn.execute("SELECT claim_a_id, claim_b_id FROM contradictions")
+    }
+
+
+def insert_contradiction(conn: sqlite3.Connection, pair: dict, v: Verdict) -> int:
+    cur = conn.execute(
+        """
+        INSERT OR IGNORE INTO contradictions
+            (claim_a_id, claim_b_id, contradiction_type, severity, explanation, confidence_score)
+        VALUES (?, ?, ?, ?, ?, ?)
+        """,
+        (pair["a"]["id"], pair["b"]["id"], v.relation_type, v.severity, v.explanation, v.confidence),
+    )
+    conn.commit()
+    return cur.rowcount
+
+
+def clear_contradictions(conn: sqlite3.Connection, claim_type: str | None = None) -> int:
+    """Borra contradicciones. Con ``claim_type``, solo las de pares de ese tipo."""
+    if claim_type:
+        where = (
+            "WHERE claim_a_id IN (SELECT id FROM claims WHERE claim_type = ?)"
+        )
+        params: tuple = (claim_type,)
+    else:
+        where, params = "", ()
+    n = conn.execute(f"SELECT COUNT(*) FROM contradictions {where}", params).fetchone()[0]
+    conn.execute(f"DELETE FROM contradictions {where}", params)
+    conn.commit()
+    return n
+
+
+def record_usage(conn: sqlite3.Connection, model: str, tin: int, tout: int, cost: float) -> None:
+    conn.execute(
+        """
+        INSERT INTO api_usage (phase, episode_id, model, tokens_input, tokens_output, cost_usd)
+        VALUES ('C', NULL, ?, ?, ?, ?)
+        """,
+        (model, tin, tout, cost),
+    )
+    conn.commit()
+
+
+# --------------------------------------------------------------------------- #
+# CLI
+# --------------------------------------------------------------------------- #
+app = typer.Typer(add_completion=False, help="Fase C — detección de contradicciones.")
+
+
+@app.command()
+def main(
+    dry_run: bool = typer.Option(False, "--dry-run", help="Solo cuenta candidatos y estima costo (sin gpt-4o)."),
+    force: bool = typer.Option(False, help="Reevalúa todos los pares (limpia contradictions)."),
+    threshold: float = typer.Option(SIM_THRESHOLD, help="Umbral de coseno para candidatos."),
+    claim_type: str = typer.Option(None, "--type", help="Evalúa solo los pares de este claim_type (validación)."),
+    verbose: bool = typer.Option(False, help="Imprime el veredicto de TODOS los pares, no solo las contradicciones."),
+    db_path: Path = typer.Option(DB_PATH, help="Ruta a la base de datos SQLite."),
+) -> None:
+    """Detecta contradicciones entre claims de episodios distintos."""
+    conn = get_connection(db_path)
+    client = _build_client()
+
+    # Paso 1a — embeddings (necesarios para cualquier modo, baratos y reutilizables).
+    emb = generate_embeddings(conn, client)
+    if emb["calls"]:
+        typer.echo(
+            f"Embeddings: {emb['embedded']} claims · {emb['calls']} llamadas · ${emb['cost']:.4f}\n"
+        )
+
+    # Paso 1b — pares candidatos.
+    claims = load_claims_with_embeddings(conn)
+    pairs = candidate_pairs(claims, threshold)
+    if claim_type:
+        pairs = [p for p in pairs if p["a"]["claim_type"] == claim_type]
+        typer.secho(f"(filtrado a claim_type='{claim_type}')", fg=typer.colors.CYAN)
+
+    by_type: dict[str, int] = {}
+    for p in pairs:
+        by_type[p["a"]["claim_type"]] = by_type.get(p["a"]["claim_type"], 0) + 1
+
+    typer.echo(f"→ Claims con embedding: {len(claims)}")
+    typer.echo(f"→ Pares candidatos (coseno ≥ {threshold}): {len(pairs)}")
+    for ctype in ("fact", "chronology", "interpretation", "speculation", "relation"):
+        if by_type.get(ctype):
+            typer.echo(f"    {ctype:14} {by_type[ctype]}")
+
+    est_cost = len(pairs) * (EST_TOKENS_IN * PRICE_IN + EST_TOKENS_OUT * PRICE_OUT)
+    est_min = len(pairs) * THROTTLE_SECONDS / 60
+    typer.echo(
+        f"\nEstimación Paso 2 (gpt-4o): ~${est_cost:.2f} "
+        f"(~{EST_TOKENS_IN}+{EST_TOKENS_OUT} tok/par) · ~{est_min:.0f} min con throttle"
+    )
+
+    if dry_run:
+        typer.secho("\n[dry-run] No se llamó a gpt-4o. Revisa el conteo y aprueba para correr.", fg=typer.colors.YELLOW)
+        conn.close()
+        return
+
+    if not pairs:
+        typer.echo("No hay pares candidatos que evaluar.")
+        conn.close()
+        return
+
+    # Paso 2 — evaluación con LLM.
+    if force:
+        removed = clear_contradictions(conn, claim_type)
+        scope = f"de tipo '{claim_type}'" if claim_type else "(todas)"
+        if removed:
+            typer.echo(f"\n--force: {removed} contradicciones previas borradas {scope}.")
+    done = existing_pairs(conn)
+
+    prompt = load_prompt()
+    counts = {"direct": 0, "evolution": 0, "abandoned": 0, "reinforced": 0, "unrelated": 0}
+    n_eval = n_saved = skipped = total_tokens = 0
+    total_cost = 0.0
+
+    typer.echo(f"\n→ Evaluando {len(pairs)} pares con gpt-4o…\n")
+    for k, pair in enumerate(pairs):
+        key = (pair["a"]["id"], pair["b"]["id"])
+        if not force and key in done:
+            skipped += 1
+            continue
+        if n_eval > 0:
+            time.sleep(THROTTLE_SECONDS)  # mantenerse bajo el TPM
+        v = evaluate_pair(pair, client, prompt)
+        record_usage(conn, v.model, v.tokens_input, v.tokens_output, v.cost_usd)
+        n_eval += 1
+        total_tokens += v.tokens_input + v.tokens_output
+        total_cost += v.cost_usd
+        counts[v.relation_type] += 1
+
+        if v.is_contradiction:
+            n_saved += insert_contradiction(conn, pair, v)
+
+        if v.is_contradiction or verbose:
+            mark = "⚠" if v.is_contradiction else "·"
+            color = typer.colors.RED if v.is_contradiction else typer.colors.WHITE
+            typer.secho(
+                f"  {mark} [{v.relation_type:10} {v.severity:6}] "
+                f"{_ep_label(pair['a'])} ↔ {_ep_label(pair['b'])} "
+                f"(sim {pair['similarity']}, conf {v.confidence})",
+                fg=color,
+            )
+            if verbose:
+                typer.echo(f"      A: {pair['a']['claim_text']}")
+                typer.echo(f"      B: {pair['b']['claim_text']}")
+                typer.echo(f"      → {v.explanation}")
+
+    conn.close()
+    typer.echo("\n" + "─" * 60)
+    typer.echo(f"Pares evaluados: {n_eval}  (saltados por idempotencia: {skipped})")
+    typer.echo(
+        f"  contradicciones guardadas: {n_saved}  "
+        f"(direct {counts['direct']} · evolution {counts['evolution']} · abandoned {counts['abandoned']})"
+    )
+    typer.echo(f"  descartadas: reinforced {counts['reinforced']} · unrelated {counts['unrelated']}")
+    typer.echo(f"Tokens: {total_tokens} | Costo real Fase C (gpt-4o): ${total_cost:.2f}")
+
+
+if __name__ == "__main__":
+    app()
