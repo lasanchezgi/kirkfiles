@@ -1,0 +1,14 @@
+# The Kirk Files — tema oscuro consistente con el tono del proyecto.
+[theme]
+base = "dark"
+primaryColor = "#A4161A"            # rojo oscuro del proyecto
+backgroundColor = "#0E1117"
+secondaryBackgroundColor = "#161B22"
+textColor = "#E6EDF3"
+font = "sans serif"
+
+[server]
+headless = true
+
+[browser]
+gatherUsageStats = false
