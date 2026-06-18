@@ -79,11 +79,13 @@ CREATE TABLE IF NOT EXISTS contradictions (
     explanation        TEXT,
     confidence_score   REAL,
     data_artifact      INTEGER NOT NULL DEFAULT 0,  -- 1 = el conflicto viene de ruido de datos (claim_text ↔ quote_verbatim), no de Candace
+    change_type        TEXT,                        -- Fase C.2: silent | acknowledged | evidence_based (solo para 'direct' limpias)
     detected_at        DATETIME DEFAULT CURRENT_TIMESTAMP,
 
     CHECK (contradiction_type IS NULL OR contradiction_type IN ('direct','evolution','abandoned','reinforced')),
     CHECK (severity           IS NULL OR severity           IN ('high','medium','low')),
     CHECK (data_artifact IN (0,1)),
+    CHECK (change_type IS NULL OR change_type IN ('silent','acknowledged','evidence_based')),
     CHECK (claim_a_id <> claim_b_id),
 
     -- idempotencia: un par de claims se evalúa una sola vez
@@ -121,7 +123,7 @@ CREATE INDEX IF NOT EXISTS idx_verifications_verdict ON verifications(verdict);
 -- ---------------------------------------------------------------------------
 CREATE TABLE IF NOT EXISTS api_usage (
     id            INTEGER PRIMARY KEY AUTOINCREMENT,
-    phase         TEXT,                             -- A5 | B | C | D
+    phase         TEXT,                             -- A5 | B | C | C2 | D
     episode_id    INTEGER REFERENCES episodes(id) ON DELETE SET NULL,
     model         TEXT,
     tokens_input  INTEGER,
@@ -129,7 +131,7 @@ CREATE TABLE IF NOT EXISTS api_usage (
     cost_usd      REAL,
     called_at     DATETIME DEFAULT CURRENT_TIMESTAMP,
 
-    CHECK (phase IS NULL OR phase IN ('A5','B','C','D'))
+    CHECK (phase IS NULL OR phase IN ('A5','B','C','C2','D'))
 );
 
 CREATE INDEX IF NOT EXISTS idx_api_usage_phase   ON api_usage(phase);

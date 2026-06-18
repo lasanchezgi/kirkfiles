@@ -21,10 +21,17 @@ presentes en ``contradictions`` no se reevalúan salvo ``--force`` (que limpia l
 y reevalúa todo). Nota: como ``reinforced``/``unrelated`` no se persisten, una
 reejecución vuelve a evaluarlos; por eso conviene cerrar la fase de una sola pasada.
 
+Fase C.2 — Clasificador de tipo de cambio narrativo (ver sección dedicada abajo):
+clasifica CÓMO cambió cada contradicción 'direct' limpia (silent | acknowledged |
+evidence_based) usando los claims intermedios con evidencia concreta.
+
 Uso:
     python -m pipeline.analyzer              # genera embeddings + evalúa candidatos
     python -m pipeline.analyzer --dry-run    # solo cuenta candidatos y estima costo
     python -m pipeline.analyzer --force      # reevalúa todos los pares
+    python -m pipeline.analyzer --phase c2           # clasifica el tipo de cambio
+    python -m pipeline.analyzer --phase c2 --limit 3 # solo las 3 más relevantes
+    python -m pipeline.analyzer --phase c2 --force   # re-clasifica todas
 """
 
 from __future__ import annotations
@@ -44,6 +51,7 @@ from scraper.happyscribe import DB_PATH, get_connection
 # --------------------------------------------------------------------------- #
 ROOT = Path(__file__).resolve().parent.parent
 PROMPT_PATH = ROOT / "prompts" / "detect_contradictions.yaml"
+PROMPT_C2_PATH = ROOT / "prompts" / "classify_change_type.yaml"
 
 EMBED_MODEL = "text-embedding-3-small"
 EMBED_BATCH = 256              # claims por llamada de embeddings
@@ -68,6 +76,17 @@ REQUEST_TIMEOUT = 60.0         # segundos por llamada antes de cortar y reintent
 _STORED_TYPES = {"direct", "evolution", "abandoned"}
 _VALID_RELATION = {"direct", "evolution", "abandoned", "reinforced", "unrelated"}
 _VALID_SEVERITY = {"high", "medium", "low"}
+
+# --- Fase C.2 — clasificador de tipo de cambio narrativo --------------------- #
+_VALID_CHANGE = {"silent", "acknowledged", "evidence_based"}
+# Solo los claims con evidencia CONCRETA cuentan como evidencia intermedia.
+C2_EVIDENCE_LEVELS = ("source_cited", "document")
+# Pre-filtro semántico de los claims intermedios (los tramos largos tienen 100+
+# claims con evidencia; sin acotar el prompt explota). El coseno NO es relevancia
+# temática — solo acota el set; el LLM decide la relevancia real. Umbral elegido
+# por la distribución observada (relacionados ~0.55+, ruido cae al ~0.33 mediano).
+C2_REL_THRESHOLD = 0.50
+C2_MAX_EVIDENCE = 12          # máx. claims intermedios que se envían al LLM
 
 
 # --------------------------------------------------------------------------- #
@@ -426,15 +445,326 @@ def flag_data_artifacts(conn: sqlite3.Connection, claim_type: str | None = None)
     return flagged
 
 
-def record_usage(conn: sqlite3.Connection, model: str, tin: int, tout: int, cost: float) -> None:
+def record_usage(
+    conn: sqlite3.Connection, model: str, tin: int, tout: int, cost: float, phase: str = "C"
+) -> None:
     conn.execute(
         """
         INSERT INTO api_usage (phase, episode_id, model, tokens_input, tokens_output, cost_usd)
-        VALUES ('C', NULL, ?, ?, ?, ?)
+        VALUES (?, NULL, ?, ?, ?, ?)
         """,
-        (model, tin, tout, cost),
+        (phase, model, tin, tout, cost),
     )
     conn.commit()
+
+
+# --------------------------------------------------------------------------- #
+# Fase C.2 — Clasificador de tipo de cambio narrativo
+# --------------------------------------------------------------------------- #
+# La Fase C detecta QUE una posición cambió (contradicción 'direct' limpia). La
+# C.2 clasifica CÓMO cambió:
+#   · evidence_based — claims intermedios con evidencia concreta (source_cited o
+#                      document) temáticamente relacionados sostienen el giro.
+#   · acknowledged   — sin evidencia intermedia suficiente, pero el claim posterior
+#                      reconoce el cambio de forma explícita ("I was wrong"…).
+#   · silent         — la posición cambió sin evidencia ni reconocimiento.
+# Regla de desempate: ante la duda evidence_based↔silent, preferir silent.
+def load_prompt_c2() -> dict:
+    import yaml
+
+    return yaml.safe_load(PROMPT_C2_PATH.read_text(encoding="utf-8"))
+
+
+@dataclass
+class ChangeVerdict:
+    change_type: str
+    reasoning: str
+    supporting_evidence_count: int
+    confidence: float
+    tokens_input: int
+    tokens_output: int
+    model: str
+
+    @property
+    def cost_usd(self) -> float:
+        return self.tokens_input * PRICE_IN + self.tokens_output * PRICE_OUT
+
+
+def direct_contradictions_to_classify(
+    conn: sqlite3.Connection, force: bool = False
+) -> list[sqlite3.Row]:
+    """Contradicciones 'direct' limpias (data_artifact=0) a clasificar.
+
+    Sin ``force`` solo devuelve las que aún no tienen change_type (idempotencia).
+    Orden estable por relevancia (severity, luego confidence) para que ``--limit``
+    procese siempre el mismo top-N."""
+    conn.row_factory = sqlite3.Row
+    sql = """
+        SELECT x.id AS cid, x.change_type, x.severity, x.confidence_score AS conf,
+               a.id AS a_id, a.claim_text AS a_text, a.quote_verbatim AS a_quote,
+               a.claim_type AS a_type, a.evidence_provided AS a_ev, a.embedding AS a_emb,
+               ea.episode_number AS a_ep, ea.published_at AS a_date,
+               b.id AS b_id, b.claim_text AS b_text, b.quote_verbatim AS b_quote,
+               b.claim_type AS b_type, b.evidence_provided AS b_ev, b.embedding AS b_emb,
+               eb.episode_number AS b_ep, eb.published_at AS b_date
+        FROM contradictions x
+        JOIN claims a   ON a.id = x.claim_a_id
+        JOIN episodes ea ON ea.id = a.episode_id
+        JOIN claims b   ON b.id = x.claim_b_id
+        JOIN episodes eb ON eb.id = b.episode_id
+        WHERE x.contradiction_type = 'direct' AND x.data_artifact = 0
+    """
+    if not force:
+        sql += " AND x.change_type IS NULL"
+    sql += """
+        ORDER BY (CASE x.severity WHEN 'high' THEN 3 WHEN 'medium' THEN 2 ELSE 1 END) DESC,
+                 x.confidence_score DESC, x.id
+    """
+    return conn.execute(sql).fetchall()
+
+
+def _order_chronologically(row: sqlite3.Row) -> tuple[dict, dict]:
+    """Devuelve (anterior, posterior) según published_at del episodio.
+
+    El par se guarda en ``contradictions`` por orden de id, no cronológico, así que
+    aquí decidimos cuál claim es la posición original (A) y cuál la revisada (B)."""
+    a = {
+        "id": row["a_id"], "ep": row["a_ep"], "date": row["a_date"], "type": row["a_type"],
+        "text": row["a_text"], "quote": row["a_quote"], "ev": row["a_ev"], "emb": row["a_emb"],
+    }
+    b = {
+        "id": row["b_id"], "ep": row["b_ep"], "date": row["b_date"], "type": row["b_type"],
+        "text": row["b_text"], "quote": row["b_quote"], "ev": row["b_ev"], "emb": row["b_emb"],
+    }
+    key = lambda c: (c["date"] or "", c["ep"] or 0, c["id"])  # noqa: E731
+    return (a, b) if key(a) <= key(b) else (b, a)
+
+
+def intermediate_evidence_claims(
+    conn: sqlite3.Connection, lo_date: str | None, hi_date: str | None
+) -> list[sqlite3.Row]:
+    """Claims con evidencia concreta publicados ESTRICTAMENTE entre ambas fechas.
+
+    El rango abierto excluye los dos episodios extremo (que están en lo/hi) y
+    cualquier episodio fuera del intervalo. Si falta una fecha, no hay rango fiable
+    → lista vacía."""
+    if not lo_date or not hi_date or lo_date >= hi_date:
+        return []
+    conn.row_factory = sqlite3.Row
+    placeholders = ",".join("?" for _ in C2_EVIDENCE_LEVELS)
+    return conn.execute(
+        f"""
+        SELECT c.id, c.claim_text, c.quote_verbatim, c.claim_type,
+               c.evidence_provided, c.embedding, e.episode_number, e.published_at
+        FROM claims c
+        JOIN episodes e ON e.id = c.episode_id
+        WHERE e.published_at > ? AND e.published_at < ?
+          AND c.evidence_provided IN ({placeholders})
+        ORDER BY e.published_at, c.id
+        """,
+        (lo_date, hi_date, *C2_EVIDENCE_LEVELS),
+    ).fetchall()
+
+
+def _rank_intermediates(
+    earlier: dict, later: dict, intermediates: list[sqlite3.Row],
+    threshold: float = C2_REL_THRESHOLD, top_k: int = C2_MAX_EVIDENCE,
+) -> list[dict]:
+    """Pre-filtra los claims intermedios por similitud coseno al conflicto.
+
+    El vector del conflicto = media normalizada de los embeddings de A y B. Devuelve
+    los top-K por encima de ``threshold`` (cada uno con su ``similarity``). Los
+    intermedios sin embedding o el conflicto sin embedding → no se puede rankear, se
+    devuelven los primeros K tal cual (degradación segura)."""
+    import numpy as np
+
+    def _unit(blob):
+        if blob is None:
+            return None
+        v = np.frombuffer(blob, dtype=np.float32)
+        n = np.linalg.norm(v)
+        return v / n if n else None
+
+    va, vb = _unit(earlier["emb"]), _unit(later["emb"])
+    conflict = None
+    if va is not None and vb is not None:
+        conflict = va + vb
+        cn = np.linalg.norm(conflict)
+        conflict = conflict / cn if cn else None
+    elif va is not None or vb is not None:
+        conflict = va if va is not None else vb
+
+    scored: list[dict] = []
+    for r in intermediates:
+        u = _unit(r["embedding"])
+        sim = float(conflict @ u) if (conflict is not None and u is not None) else None
+        scored.append({
+            "id": r["id"], "ep": r["episode_number"], "date": r["published_at"],
+            "type": r["claim_type"], "text": r["claim_text"], "quote": r["quote_verbatim"],
+            "ev": r["evidence_provided"], "similarity": sim,
+        })
+
+    if conflict is None or any(s["similarity"] is None for s in scored):
+        return scored[:top_k]  # sin embeddings no hay ranking fiable
+
+    scored.sort(key=lambda s: s["similarity"], reverse=True)
+    return [s for s in scored if s["similarity"] >= threshold][:top_k]
+
+
+def _format_intermediates(items: list[dict]) -> str:
+    if not items:
+        return "(none — there are no intermediate claims carrying concrete evidence)"
+    lines = []
+    for s in items:
+        sim = f"sim {s['similarity']:.2f}" if s.get("similarity") is not None else "sim n/a"
+        lines.append(
+            f"  - Ep {s['ep']} ({s['date']}) [{s['ev']}, {sim}]: {s['text']}\n"
+            f'      verbatim: "{s["quote"]}"'
+        )
+    return "\n".join(lines)
+
+
+def _sanitize_change(data: dict, has_evidence: bool) -> tuple[str, str, int, float]:
+    """Valida la salida del LLM y aplica el desempate duro.
+
+    Si el LLM dice 'evidence_based' pero NO hay evidencia intermedia relacionada
+    (has_evidence=False), no puede ser evidence_based → se degrada a 'silent'
+    (preferir subestimar evidence_based). Valores fuera del set → 'silent'."""
+    ct = str(data.get("change_type", "")).strip().lower()
+    if ct not in _VALID_CHANGE:
+        ct = "silent"
+    if ct == "evidence_based" and not has_evidence:
+        ct = "silent"
+    try:
+        count = max(0, int(data.get("supporting_evidence_count", 0)))
+    except (TypeError, ValueError):
+        count = 0
+    if ct != "evidence_based":
+        count = 0
+    try:
+        conf = max(0.0, min(1.0, float(data.get("confidence", 0.0))))
+    except (TypeError, ValueError):
+        conf = 0.0
+    reasoning = str(data.get("reasoning", "")).strip()
+    return ct, reasoning, count, round(conf, 3)
+
+
+def classify_change_type(
+    conn: sqlite3.Connection, row: sqlite3.Row, client, prompt: dict
+) -> tuple[ChangeVerdict, list[dict]]:
+    """Clasifica una contradicción 'direct'. Devuelve (veredicto, evidencia usada)."""
+    earlier, later = _order_chronologically(row)
+    raw_inter = intermediate_evidence_claims(conn, earlier["date"], later["date"])
+    evidence = _rank_intermediates(earlier, later, raw_inter)
+    has_evidence = len(evidence) > 0
+
+    ctx = {
+        "ep_a": f"Ep {earlier['ep']}" if earlier["ep"] else f"id {earlier['id']}",
+        "date_a": earlier["date"] or "s/f", "type_a": earlier["type"],
+        "text_a": earlier["text"], "quote_a": earlier["quote"],
+        "ep_b": f"Ep {later['ep']}" if later["ep"] else f"id {later['id']}",
+        "date_b": later["date"] or "s/f", "type_b": later["type"],
+        "text_b": later["text"], "quote_b": later["quote"],
+        "intermediate_block": _format_intermediates(evidence),
+    }
+    messages = [
+        {"role": "system", "content": prompt["system"]},
+        {"role": "user", "content": prompt["user"].format(**ctx)},
+    ]
+    resp = _with_retry(
+        client.chat.completions.create,
+        model=prompt.get("model", "gpt-4o"),
+        messages=messages,
+        temperature=prompt.get("temperature", 0),
+        max_tokens=prompt.get("max_tokens", 500),
+        response_format={"type": "json_object"},
+    )
+    data = json.loads(resp.choices[0].message.content)
+    ct, reasoning, count, conf = _sanitize_change(data, has_evidence)
+    verdict = ChangeVerdict(
+        change_type=ct, reasoning=reasoning, supporting_evidence_count=count,
+        confidence=conf, tokens_input=resp.usage.prompt_tokens,
+        tokens_output=resp.usage.completion_tokens, model=resp.model,
+    )
+    return verdict, evidence
+
+
+def set_change_type(conn: sqlite3.Connection, contradiction_id: int, change_type: str) -> None:
+    conn.execute(
+        "UPDATE contradictions SET change_type = ? WHERE id = ?",
+        (change_type, contradiction_id),
+    )
+    conn.commit()
+
+
+def change_type_breakdown(conn: sqlite3.Connection) -> dict[str, int]:
+    """Conteo de las 'direct' limpias ya clasificadas, por change_type."""
+    counts = {"evidence_based": 0, "acknowledged": 0, "silent": 0}
+    rows = conn.execute(
+        """
+        SELECT change_type, COUNT(*) FROM contradictions
+        WHERE contradiction_type = 'direct' AND data_artifact = 0
+          AND change_type IS NOT NULL
+        GROUP BY change_type
+        """
+    ).fetchall()
+    for ct, n in rows:
+        counts[ct] = n
+    return counts
+
+
+def run_c2(
+    conn: sqlite3.Connection, client, force: bool = False, limit: int = 0, show_reasoning: bool = True
+) -> dict:
+    """Clasifica las contradicciones 'direct' limpias. Devuelve métricas del run."""
+    pending = direct_contradictions_to_classify(conn, force=force)
+    if limit > 0:
+        pending = pending[:limit]
+
+    prompt = load_prompt_c2()
+    stats = {"classified": 0, "cost": 0.0, "tokens": 0,
+             "evidence_based": 0, "acknowledged": 0, "silent": 0}
+
+    if not pending:
+        typer.secho("No hay contradicciones 'direct' pendientes de clasificar.", fg=typer.colors.YELLOW)
+        return stats
+
+    typer.echo(f"\n→ Clasificando {len(pending)} contradicción(es) 'direct' con gpt-4o…\n")
+    for k, row in enumerate(pending):
+        if stats["classified"] > 0:
+            time.sleep(THROTTLE_SECONDS)
+        verdict, evidence = classify_change_type(conn, row, client, prompt)
+        set_change_type(conn, row["cid"], verdict.change_type)
+        record_usage(conn, verdict.model, verdict.tokens_input, verdict.tokens_output,
+                     verdict.cost_usd, phase="C2")
+
+        stats["classified"] += 1
+        stats[verdict.change_type] += 1
+        stats["cost"] += verdict.cost_usd
+        stats["tokens"] += verdict.tokens_input + verdict.tokens_output
+
+        earlier, later = _order_chronologically(row)
+        color = {"evidence_based": typer.colors.GREEN, "acknowledged": typer.colors.CYAN,
+                 "silent": typer.colors.RED}[verdict.change_type]
+        typer.secho(
+            f"  [{verdict.change_type:14}] Ep{earlier['ep']} → Ep{later['ep']}  "
+            f"(conf {verdict.confidence}, evidencia rel. {verdict.supporting_evidence_count}/"
+            f"{len(evidence)} enviada)",
+            fg=color,
+        )
+        if show_reasoning:
+            typer.echo(f"      A (Ep{earlier['ep']}, {earlier['date']}): {earlier['text']}")
+            typer.echo(f"      B (Ep{later['ep']}, {later['date']}): {later['text']}")
+            if evidence:
+                typer.echo(f"      Evidencia intermedia considerada ({len(evidence)}):")
+                for s in evidence:
+                    sim = f"{s['similarity']:.2f}" if s.get("similarity") is not None else "n/a"
+                    typer.echo(f"        · Ep{s['ep']} [{s['ev']}, sim {sim}]: {s['text']}")
+            else:
+                typer.echo("      Evidencia intermedia considerada: (ninguna)")
+            typer.echo(f"      → {verdict.reasoning}\n")
+
+    return stats
 
 
 # --------------------------------------------------------------------------- #
@@ -445,8 +775,10 @@ app = typer.Typer(add_completion=False, help="Fase C — detección de contradic
 
 @app.command()
 def main(
+    phase: str = typer.Option("c", "--phase", help="Fase a correr: 'c' (detección) o 'c2' (clasificación de cambio)."),
     dry_run: bool = typer.Option(False, "--dry-run", help="Solo cuenta candidatos y estima costo (sin gpt-4o)."),
-    force: bool = typer.Option(False, help="Reevalúa todos los pares (limpia contradictions)."),
+    force: bool = typer.Option(False, help="Reevalúa/reclasifica todo (ignora idempotencia)."),
+    limit: int = typer.Option(0, "--limit", help="C.2: clasifica solo las N más relevantes (0 = todas)."),
     threshold: float = typer.Option(SIM_THRESHOLD, help="Umbral de coseno para candidatos."),
     claim_type: str = typer.Option(None, "--type", help="Evalúa solo los pares de este claim_type (validación)."),
     verbose: bool = typer.Option(False, help="Imprime el veredicto de TODOS los pares, no solo las contradicciones."),
@@ -455,6 +787,20 @@ def main(
     """Detecta contradicciones entre claims de episodios distintos."""
     conn = get_connection(db_path)
     client = _build_client()
+
+    # Fase C.2 — clasificación del tipo de cambio narrativo (rama independiente).
+    if phase.lower() == "c2":
+        stats = run_c2(conn, client, force=force, limit=limit)
+        breakdown = change_type_breakdown(conn)
+        total = sum(breakdown.values())
+        conn.close()
+        typer.echo("\n" + "─" * 60)
+        typer.echo(f"Contradicciones direct clasificadas: {total}")
+        typer.echo(f"  evidence_based:  {breakdown['evidence_based']}")
+        typer.echo(f"  acknowledged:    {breakdown['acknowledged']}")
+        typer.echo(f"  silent:          {breakdown['silent']}")
+        typer.echo(f"Costo real: ${stats['cost']:.2f}")
+        return
 
     # Paso 1a — embeddings (necesarios para cualquier modo, baratos y reutilizables).
     emb = generate_embeddings(conn, client)

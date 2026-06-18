@@ -135,3 +135,165 @@ def test_insert_contradiction_idempotent():
     assert analyzer.insert_contradiction(conn, pair, v) == 0  # UNIQUE(a,b)
     assert analyzer.existing_pairs(conn) == {(1, 2)}
     conn.close()
+
+
+# --------------------------------------------------------------------------- #
+# Fase C.2 — clasificador de tipo de cambio narrativo
+# --------------------------------------------------------------------------- #
+def _seed_c2():
+    """DB con 3 episodios en fechas crecientes y una contradicción 'direct'
+    Ep(1, anterior) ↔ Ep(3, posterior). El episodio 2 queda EN MEDIO."""
+    conn = sqlite3.connect(":memory:")
+    conn.executescript(SCHEMA_PATH.read_text(encoding="utf-8"))
+    eps = [(1, 100, "2025-09-10"), (2, 200, "2025-09-15"), (3, 300, "2025-09-20")]
+    for eid, num, date in eps:
+        conn.execute(
+            "INSERT INTO episodes (id,episode_number,title,url,published_at,relevance_label) "
+            "VALUES (?,?,?,?,?,'high')",
+            (eid, num, f"E{eid}", f"u{eid}", date),
+        )
+    # claim 1 (Ep1, posición A) ↔ claim 2 (Ep3, posición B): contradicción direct.
+    conn.execute(
+        "INSERT INTO claims (id,episode_id,claim_text,claim_type,quote_verbatim,evidence_provided) "
+        "VALUES (1,1,'Tyler acted alone','fact','he acted alone','none')"
+    )
+    conn.execute(
+        "INSERT INTO claims (id,episode_id,claim_text,claim_type,quote_verbatim,evidence_provided) "
+        "VALUES (2,3,'Tyler did not act alone','fact','he did not act alone','none')"
+    )
+    conn.execute(
+        "INSERT INTO contradictions "
+        "(id,claim_a_id,claim_b_id,contradiction_type,severity,confidence_score,data_artifact) "
+        "VALUES (1,1,2,'direct','high',1.0,0)"
+    )
+    conn.commit()
+    return conn
+
+
+def test_intermediate_excludes_endpoint_and_out_of_range_episodes():
+    """Solo los claims con evidencia de episodios ESTRICTAMENTE entre las dos
+    fechas cuentan como intermedios; los extremos y los de fuera no."""
+    conn = _seed_c2()
+    # Episodios fuera de rango: uno antes, uno después.
+    conn.execute(
+        "INSERT INTO episodes (id,episode_number,title,url,published_at,relevance_label) "
+        "VALUES (4,400,'E4','u4','2025-09-05','high')"  # antes del rango
+    )
+    conn.execute(
+        "INSERT INTO episodes (id,episode_number,title,url,published_at,relevance_label) "
+        "VALUES (5,500,'E5','u5','2025-09-25','high')"  # después del rango
+    )
+    # Evidencia en: Ep1 (extremo), Ep2 (intermedio ✓), Ep3 (extremo), Ep4/Ep5 (fuera).
+    rows = [
+        (10, 1, "ep1 evidence", "source_cited"),
+        (11, 2, "ep2 intermediate evidence", "source_cited"),
+        (12, 3, "ep3 evidence", "document"),
+        (13, 4, "ep4 evidence", "document"),
+        (14, 5, "ep5 evidence", "source_cited"),
+        # intermedio pero SIN evidencia concreta → no debe aparecer.
+        (15, 2, "ep2 no evidence", "none"),
+    ]
+    for cid, ep, txt, ev in rows:
+        conn.execute(
+            "INSERT INTO claims (id,episode_id,claim_text,claim_type,quote_verbatim,evidence_provided) "
+            "VALUES (?,?,?,'fact',?,?)",
+            (cid, ep, txt, f"q{cid}", ev),
+        )
+    conn.commit()
+
+    inter = analyzer.intermediate_evidence_claims(conn, "2025-09-10", "2025-09-20")
+    ids = {r["id"] for r in inter}
+    assert ids == {11}  # solo el claim intermedio con evidencia concreta
+    conn.close()
+
+
+def test_intermediate_empty_when_no_range():
+    conn = _seed_c2()
+    assert analyzer.intermediate_evidence_claims(conn, None, "2025-09-20") == []
+    assert analyzer.intermediate_evidence_claims(conn, "2025-09-20", "2025-09-20") == []
+    conn.close()
+
+
+def test_order_chronologically_uses_published_at_not_id():
+    """El par se guarda por id, pero A/B deben salir por fecha de publicación."""
+    # claim a_id=2 es CRONOLÓGICAMENTE posterior (fecha mayor) que b_id=1.
+    row = {
+        "a_id": 2, "a_ep": 300, "a_date": "2025-09-20", "a_type": "fact",
+        "a_text": "later", "a_quote": "q2", "a_ev": "none", "a_emb": None,
+        "b_id": 1, "b_ep": 100, "b_date": "2025-09-10", "b_type": "fact",
+        "b_text": "earlier", "b_quote": "q1", "b_ev": "none", "b_emb": None,
+    }
+    earlier, later = analyzer._order_chronologically(row)
+    assert earlier["text"] == "earlier" and earlier["ep"] == 100
+    assert later["text"] == "later" and later["ep"] == 300
+
+
+def test_sanitize_change_evidence_based_requires_evidence():
+    """evidence_based solo es válido si HAY evidencia intermedia relacionada;
+    sin ella se degrada a 'silent' (preferir subestimar evidence_based)."""
+    data = {"change_type": "evidence_based", "supporting_evidence_count": 3,
+            "confidence": 0.9, "reasoning": "x"}
+    # con evidencia → se respeta
+    ct, _, count, _ = analyzer._sanitize_change(data, has_evidence=True)
+    assert ct == "evidence_based" and count == 3
+    # sin evidencia → degrada a silent y resetea el conteo
+    ct, _, count, _ = analyzer._sanitize_change(data, has_evidence=False)
+    assert ct == "silent" and count == 0
+
+
+def test_sanitize_change_silent_when_nothing_intermediate():
+    """Sin evidencia y sin reconocimiento, el LLM dice silent y se conserva."""
+    data = {"change_type": "silent", "supporting_evidence_count": 0,
+            "confidence": 0.7, "reasoning": "no intermediate evidence, no admission"}
+    ct, _, count, conf = analyzer._sanitize_change(data, has_evidence=False)
+    assert ct == "silent" and count == 0 and conf == 0.7
+
+
+def test_sanitize_change_acknowledged_preserved_without_evidence():
+    data = {"change_type": "acknowledged", "supporting_evidence_count": 0,
+            "confidence": 0.8, "reasoning": "she says 'I was wrong'"}
+    ct, _, count, _ = analyzer._sanitize_change(data, has_evidence=False)
+    assert ct == "acknowledged" and count == 0
+
+
+def test_sanitize_change_coerces_invalid_to_silent():
+    data = {"change_type": "bogus", "confidence": 9, "supporting_evidence_count": -2}
+    ct, _, count, conf = analyzer._sanitize_change(data, has_evidence=True)
+    assert ct == "silent" and count == 0 and conf == 1.0
+
+
+def test_direct_to_classify_idempotent_until_force():
+    """No reclasifica una contradicción que ya tiene change_type, salvo --force."""
+    conn = _seed_c2()
+    # pendiente al inicio
+    assert [r["cid"] for r in analyzer.direct_contradictions_to_classify(conn)] == [1]
+    # tras asignar change_type → ya no es pendiente
+    analyzer.set_change_type(conn, 1, "silent")
+    assert analyzer.direct_contradictions_to_classify(conn) == []
+    # con force vuelve a aparecer
+    assert [r["cid"] for r in analyzer.direct_contradictions_to_classify(conn, force=True)] == [1]
+    conn.close()
+
+
+def test_direct_to_classify_skips_data_artifacts_and_non_direct():
+    conn = _seed_c2()
+    # otra 'direct' pero marcada como artefacto de datos → no debe clasificarse
+    conn.execute(
+        "INSERT INTO claims (id,episode_id,claim_text,claim_type,quote_verbatim) "
+        "VALUES (3,2,'c3','fact','q3')"
+    )
+    conn.execute(
+        "INSERT INTO contradictions "
+        "(id,claim_a_id,claim_b_id,contradiction_type,severity,confidence_score,data_artifact) "
+        "VALUES (2,1,3,'direct','high',1.0,1)"
+    )
+    # una 'evolution' limpia → tampoco (C.2 solo aplica a 'direct')
+    conn.execute(
+        "INSERT INTO contradictions "
+        "(id,claim_a_id,claim_b_id,contradiction_type,severity,confidence_score,data_artifact) "
+        "VALUES (3,2,3,'evolution','medium',0.8,0)"
+    )
+    conn.commit()
+    cids = [r["cid"] for r in analyzer.direct_contradictions_to_classify(conn)]
+    assert cids == [1]  # solo la 'direct' limpia original
+    conn.close()
