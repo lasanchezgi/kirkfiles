@@ -62,6 +62,7 @@ EST_TOKENS_OUT = 150
 # (~850 tokens), así que una pausa corta + backoff ante 429 basta.
 THROTTLE_SECONDS = 2.5
 MAX_RETRIES = 6
+REQUEST_TIMEOUT = 60.0         # segundos por llamada antes de cortar y reintentar
 
 # Solo estos tipos son contradicciones que se guardan.
 _STORED_TYPES = {"direct", "evolution", "abandoned"}
@@ -83,21 +84,29 @@ def _build_client():
     from openai import OpenAI
 
     load_dotenv(ROOT / ".env")
-    return OpenAI()
+    # timeout por request: si el socket queda muerto (p.ej. tras suspender el equipo)
+    # la llamada falla en REQUEST_TIMEOUT en vez de colgarse para siempre, y
+    # _with_retry la reintenta. max_retries=0 → el backoff lo controlamos nosotros.
+    return OpenAI(timeout=REQUEST_TIMEOUT, max_retries=0)
 
 
 def _with_retry(fn, **kwargs):
-    """Ejecuta una llamada a la API reintentando con backoff ante un 429."""
-    from openai import RateLimitError
+    """Ejecuta una llamada a la API reintentando con backoff ante un 429 o un fallo
+    transitorio de red/timeout (socket muerto tras suspensión, corte de red)."""
+    from openai import APIConnectionError, APITimeoutError, InternalServerError, RateLimitError
 
+    transient = (RateLimitError, APITimeoutError, APIConnectionError, InternalServerError)
     for attempt in range(MAX_RETRIES):
         try:
             return fn(**kwargs)
-        except RateLimitError:
+        except transient as exc:
             if attempt == MAX_RETRIES - 1:
                 raise
             wait = THROTTLE_SECONDS * (attempt + 1) * 2
-            typer.secho(f"    · rate limit, reintento en {wait:.0f}s…", fg=typer.colors.YELLOW)
+            typer.secho(
+                f"    · {type(exc).__name__}, reintento en {wait:.0f}s…",
+                fg=typer.colors.YELLOW,
+            )
             time.sleep(wait)
     raise RuntimeError("unreachable")
 
