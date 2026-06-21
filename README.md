@@ -259,14 +259,28 @@ streamlit run ui/app.py
 
 ## Estado del proyecto
 
-| Fase | Estado |
-|---|---|
-| A — Scraping | ✅ Hecho |
-| A.5 — Clasificador | ⬜ Pendiente |
-| B — Extracción claims | ⬜ Pendiente |
-| C — Contradicciones | ⬜ Pendiente |
-| D — Verificación | ⬜ Pendiente |
-| E — Dashboard | ⬜ Pendiente |
+| Fase | Estado | Datos |
+|---|---|---|
+| A — Scraping | ✅ Completa | 104 episodios |
+| A.5 — Clasificador | ✅ Completa | 80 high · 17 partial · 2 low · 5 none |
+| B — Extracción claims | ✅ Completa | 1,221 claims |
+| C — Contradicciones | ✅ Completa | 195 total · 191 limpias · 4 artefactos |
+| C.2 — Tipo de cambio | ✅ Completa | silent / evidence_based / acknowledged |
+| D — Verificación | ✅ Completa | 28 verificaciones (Nivel 1) |
+| E — Dashboard | ✅ Completa | 5 vistas: Timeline, Episodio, Contradicciones, Verificaciones, Personas |
+
+---
+
+## Hallazgos principales del corpus (sep 2025 – jun 2026)
+
+- **104 episodios** analizados · **1,221 claims** extraídos · **$11.02** costo total de API
+- **80 episodios** con contenido relevante sobre el caso Charlie Kirk
+- **191 contradicciones** detectadas: 16 directas · 163 evoluciones · 13 abandonadas
+- **11 cambios silenciosos** (posición cambió sin evidencia ni reconocimiento)
+- **5 cambios con evidencia** (posición cambió respaldada por claims intermedios)
+- **0 cambios reconocidos** (nunca usó lenguaje explícito de revisión en 9 meses)
+- Hallazgo central: Ep237 → Ep350 — "Tyler actuó solo" → "Tyler no cometió el asesinato"
+  Clasificado como **silent** · Verificación externa: claim original **supported**, claim final **contradicted**
 
 ---
 
