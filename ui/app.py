@@ -15,6 +15,7 @@ Vistas:
     ⚡ Contradicciones — tabla filtrable con el tipo de cambio narrativo
     ✅ Verificaciones  — claims verificados contra fuentes externas  (paso 2)
     👤 Personas        — quién aparece, dónde y en cuántas contradicciones (paso 2)
+    📊 Coherencia      — scorecard narrativo de 4 dimensiones, sin veredicto  (E.2)
 """
 
 from __future__ import annotations
@@ -64,6 +65,10 @@ CLAIM_TYPE_LABEL = {"fact": "Hechos", "chronology": "Cronología",
                     "relation": "Relación"}
 EVIDENCE_COLORS = {"source_cited": GREEN, "document": GREEN, "anecdotal": AMBER, "none": GRAY}
 CONF_COLORS = {"high": GREEN, "medium": AMBER, "low": GRAY, "unknown": FAINT}
+
+# E.2 — scorecard de coherencia. Nivel 2 de verificación (Fase D) apunta a ~192
+# claims (backlog). Mientras `verifications < NIVEL_2_TARGET`, el scorecard es parcial.
+NIVEL_2_TARGET = 192
 
 st.set_page_config(
     page_title="The Kirk Files",
@@ -194,6 +199,79 @@ def claim_contradiction_index() -> dict:
 
 
 @st.cache_data(show_spinner=False)
+def scorecard() -> dict:
+    """Métricas del scorecard de coherencia (E.2).
+
+    No emite veredicto: solo el porcentaje por dimensión calculado sobre los datos
+    existentes. Se recalcula solo cuando avancen las verificaciones (Nivel 2), así
+    que el respaldo externo deja de ser parcial sin tocar este código.
+    """
+    contra = load_contradictions()
+    direct = contra[(contra["contradiction_type"] == "direct") & (contra["data_artifact"] == 0)]
+    n_direct = len(direct)
+    ct = direct["change_type"].value_counts().to_dict()
+    silent = int(ct.get("silent", 0))
+    acknowledged = int(ct.get("acknowledged", 0))
+    evidence_based = int(ct.get("evidence_based", 0))
+
+    v = load_verifications()
+    vd = v["verdict"].value_counts().to_dict()
+    supported = int(vd.get("supported", 0))
+    contradicted = int(vd.get("contradicted", 0))
+    n_verified = len(v)
+    total_claims = len(load_claims())
+
+    def pct(num: int, den: int) -> float:
+        return (num / den) if den else 0.0
+
+    dims = [
+        {
+            "label": "Consistencia interna",
+            "measure": "Cambios de posición con sustento frente a cambios silenciosos",
+            "source": "tabla contradictions",
+            "pct": pct(evidence_based, n_direct),
+            "fraction": f"{evidence_based}/{n_direct}",
+            "detail": f"{evidence_based} con evidencia · {silent} silenciosos · {acknowledged} reconocidos",
+            "color": GREEN,
+        },
+        {
+            "label": "Respaldo externo",
+            "measure": "Claims verificados respaldados por fuentes externas",
+            "source": "tabla verifications",
+            "pct": pct(supported, n_verified),
+            "fraction": f"{supported}/{n_verified}",
+            "detail": f"{supported} supported · {contradicted} contradicted",
+            "color": GREEN,
+        },
+        {
+            "label": "Evolución con evidencia",
+            "measure": "Cambios respaldados por evidencia en episodios intermedios",
+            "source": "contradictions.change_type",
+            "pct": pct(evidence_based, n_direct),
+            "fraction": f"{evidence_based}/{n_direct}",
+            "detail": f"{evidence_based} de {n_direct} cambios directos",
+            "color": GREEN,
+        },
+        {
+            "label": "Transparencia narrativa",
+            "measure": "Cambios reconocidos explícitamente por Candace",
+            "source": "contradictions.change_type",
+            "pct": pct(acknowledged, n_direct),
+            "fraction": f"{acknowledged}/{n_direct}",
+            "detail": f"{acknowledged} reconocidos de {n_direct} cambios directos",
+            "color": AMBER,
+        },
+    ]
+    return {
+        "dims": dims,
+        "n_verified": n_verified,
+        "total_claims": total_claims,
+        "nivel2_target": NIVEL_2_TARGET,
+        "nivel2_complete": n_verified >= NIVEL_2_TARGET,
+    }
+
+
+@st.cache_data(show_spinner=False)
 def people_stats() -> tuple[pd.DataFrame, pd.DataFrame]:
     """Agrega menciones de personas. Devuelve (resumen_por_persona, claims_por_persona).
 
@@ -273,6 +351,7 @@ NAV = [
     ("⚡ Contradicciones", "contradictions"),
     ("✅ Verificaciones", "verifications"),
     ("👤 Personas", "people"),
+    ("📊 Coherencia", "coherence"),
 ]
 
 
@@ -801,6 +880,62 @@ def view_people() -> None:
 
 
 # --------------------------------------------------------------------------- #
+# Vista: Coherencia (scorecard narrativo — E.2)
+# --------------------------------------------------------------------------- #
+def _score_bar(d: dict) -> str:
+    """Una barra horizontal: label · porcentaje · fracción · qué mide · fuente."""
+    pct = d["pct"]
+    width = max(pct * 100, 1.5)  # deja siempre un sliver visible aunque sea 0%
+    return f"""
+<div style='margin:0 0 1.6rem 0'>
+  <div style='display:flex;justify-content:space-between;align-items:baseline;margin-bottom:0.35rem'>
+    <span style='font-weight:600;font-size:1.05rem;color:{INK}'>{d['label']}</span>
+    <span style='font-weight:700;font-size:1.2rem;color:{d['color']}'>{pct*100:.0f}%
+      <span style='color:{GRAY};font-weight:500;font-size:0.85rem'>&nbsp;({d['fraction']})</span>
+    </span>
+  </div>
+  <div style='background:{PANEL};border:1px solid {FAINT}44;border-radius:7px;height:16px;overflow:hidden'>
+    <div style='width:{width:.1f}%;height:100%;background:{d['color']};border-radius:7px 0 0 7px'></div>
+  </div>
+  <div style='color:{GRAY};font-size:0.86rem;margin-top:0.35rem'>{d['measure']}
+    <span style='color:{FAINT}'> · {d['detail']} · fuente: {d['source']}</span>
+  </div>
+</div>
+"""
+
+
+def view_coherence() -> None:
+    st.title("📊 Coherencia")
+    st.caption(
+        "¿La investigación es internamente coherente y externamente respaldada? "
+        "Esta vista no emite un veredicto: presenta cuatro dimensiones para que el "
+        "lector conecte los puntos."
+    )
+
+    sc = scorecard()
+
+    if not sc["nivel2_complete"]:
+        st.warning(
+            f"**Scorecard parcial.** La verificación externa está en Nivel 1 — "
+            f"{sc['n_verified']} de los ~{sc['nivel2_target']} claims objetivo del Nivel 2. "
+            f"La dimensión de *respaldo externo* es preliminar y puede cambiar al "
+            f"completar la Fase D.",
+            icon="⚠️",
+        )
+
+    st.write("")
+    for d in sc["dims"]:
+        st.markdown(_score_bar(d), unsafe_allow_html=True)
+
+    st.divider()
+    st.caption(
+        f"Basado en {sc['n_verified']} claims verificados de {sc['total_claims']:,} totales — "
+        f"scorecard parcial hasta completar Nivel 2 de verificación. Sin score agregado "
+        f"ni veredicto final: las conclusiones son del lector."
+    )
+
+
+# --------------------------------------------------------------------------- #
 # Router
 # --------------------------------------------------------------------------- #
 VIEWS = {
@@ -809,6 +944,7 @@ VIEWS = {
     "contradictions": view_contradictions,
     "verifications": view_verifications,
     "people": view_people,
+    "coherence": view_coherence,
 }
 
 

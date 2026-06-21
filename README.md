@@ -125,6 +125,7 @@ Tipos de contradicción: `direct` | `evolution` | `abandoned` | `reinforced`
 - Grafo de personas mencionadas
 - Contradicciones detectadas con episodios de origen
 - Verificaciones externas con fuentes
+- **Coherencia (E.2)** — scorecard narrativo de 4 dimensiones, sin veredicto
 
 ---
 
@@ -267,7 +268,8 @@ streamlit run ui/app.py
 | C — Contradicciones | ✅ Completa | 195 total · 191 limpias · 4 artefactos |
 | C.2 — Tipo de cambio | ✅ Completa | silent / evidence_based / acknowledged |
 | D — Verificación | ✅ Completa | 28 verificaciones (Nivel 1) |
-| E — Dashboard | ✅ Completa | 5 vistas: Timeline, Episodio, Contradicciones, Verificaciones, Personas |
+| E — Dashboard | ✅ Completa | 6 vistas: Timeline, Episodio, Contradicciones, Verificaciones, Personas, Coherencia |
+| E.2 — Scorecard coherencia | ✅ Completa | 4 dimensiones · respaldo externo parcial hasta Nivel 2 |
 
 ---
 

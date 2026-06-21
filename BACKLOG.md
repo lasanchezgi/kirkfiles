@@ -1,34 +1,31 @@
 # Backlog — The Kirk Files
 
-## C.2 — Clasificador de tipo de cambio narrativo
+> **C.2 — Clasificador de tipo de cambio narrativo:** ✅ **Completa** (ver README).
+> Implementada en `pipeline/analyzer.py` (`run_c2`), prompt en
+> `prompts/classify_change_type.yaml`, tests 20/20 en `tests/test_analyzer.py`. Las 16
+> contradicciones `direct` limpias ya están clasificadas en DB: 11 silent · 5
+> evidence_based · 0 acknowledged. No queda trabajo pendiente.
 
-**Contexto:**
-El sistema detecta *que* una posición cambió entre episodios, pero no *cómo* cambió.
-Un cambio silencioso (inconsistencia real) no es lo mismo que un cambio construido
-sobre evidencia presentada en episodios intermedios (investigación funcionando).
+## E.2 — Vista: Coherencia (scorecard narrativo) ✅ UI implementada
 
-**Campo a agregar en tabla `contradictions`:**
-`change_type TEXT` con valores:
-
-- `silent` — la posición cambió sin reconocimiento ni evidencia en episodios intermedios
-- `acknowledged` — Candace reconoció explícitamente el cambio pero sin nueva evidencia
-- `evidence_based` — el cambio vino acompañado de claims con evidence_provided
-  = 'source_cited' o 'document' en episodios intermedios
-
-**Cómo implementarlo:**
-Los datos ya están en DB. Para cada contradicción `direct` (data_artifact=0):
-
-1. Identificar episodios intermedios entre episode_a y episode_b
-2. Consultar claims intermedios con evidence_provided IN ('source_cited', 'document')
-3. LLM evalúa si esa evidencia intermedia justifica el cambio de posición
-4. Asigna change_type
-
-**Prioridad:** Alta — es el diferenciador analítico central del dashboard
-**Bloquea:** Fase E (visualización de contradicciones)
-**Costo estimado:** ~$0.16 (16 contradicciones direct × ~$0.01 c/u)
-**Caso ejemplo:** Ep237 ("Tyler actuó solo") ↔ Ep350 ("Tyler no cometió el asesinato")
-
-## E.2 — Vista: Coherencia (scorecard narrativo)
+> **Estado (2026-06-21):** La vista `📊 Coherencia` está construida en `ui/app.py`
+> (`view_coherence` + `scorecard()`), registrada en el NAV y probada con `AppTest`.
+> Las 4 dimensiones calculan en vivo desde la DB (31% / 39% / 31% / 0%, idénticos a
+> los valores proyectados abajo). El banner de advertencia de "scorecard parcial" se
+> muestra mientras `verifications < 192` (Nivel 2). **Lo único pendiente es dato, no
+> código.**
+>
+> **Único paso restante — correr el Nivel 2:**
+>
+> ```bash
+> python -m pipeline.verifier --level 2
+> ```
+>
+> Esto verifica todos los claims con fuente citada para tener cobertura de todos los
+> episodios (~192 claims, ~$15). Al terminar, la dimensión de *respaldo externo* deja
+> de ser parcial, el banner de advertencia desaparece y el scorecard se recalcula solo
+> (no hay que tocar código). Antes de gastar, se puede estimar con
+> `python -m pipeline.verifier --level 2 --dry-run`.
 
 **Contexto:**
 El dashboard muestra los datos desagregados (contradicciones, verificaciones, claims)
